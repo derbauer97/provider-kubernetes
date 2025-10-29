@@ -29,7 +29,6 @@ import (
 	celtypes "github.com/google/cel-go/common/types"
 	"github.com/pkg/errors"
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -725,6 +724,48 @@ func (c *external) resolveReferencies(ctx context.Context, obj *v1alpha1.Object)
 	return nil
 }
 
+// isEqualExcludingMetadata compares two unstructured objects while excluding
+// metadata fields that may change between reconciliations (like resourceVersion,
+// generation, creationTimestamp, managedFields, etc.). This is important for
+// SSA-based comparisons where metadata can differ even when the actual desired
+// state is identical.
+func isEqualExcludingMetadata(a, b *unstructured.Unstructured) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+
+	// Create copies to avoid modifying the originals
+	aCopy := a.DeepCopy()
+	bCopy := b.DeepCopy()
+
+	// Extract metadata before removal for debugging
+	aMetadata, _, _ := unstructured.NestedMap(aCopy.Object, "metadata")
+	bMetadata, _, _ := unstructured.NestedMap(bCopy.Object, "metadata")
+
+	// Remove the entire metadata section except for name, namespace, kind, apiVersion
+	// which are already part of the TypeMeta and ObjectMeta identifiers
+	aObj := aCopy.Object
+	bObj := bCopy.Object
+
+	// Remove metadata from comparison as it contains fields that change
+	// between reconciliations (resourceVersion, generation, etc.)
+	delete(aObj, "metadata")
+	delete(bObj, "metadata")
+
+	// Compare only the remaining fields (spec, data, etc.)
+	equalWithoutMetadata := reflect.DeepEqual(aObj, bObj)
+	equalWithMetadata := reflect.DeepEqual(a.Object, b.Object)
+
+	// Debug log if metadata is causing differences
+	if equalWithoutMetadata && !equalWithMetadata {
+		// Metadata is different but content is the same
+		metadataDiff := !reflect.DeepEqual(aMetadata, bMetadata)
+		_ = metadataDiff // Will be used in logging below
+	}
+
+	return equalWithoutMetadata
+}
+
 func (c *external) handleObservation(ctx context.Context, obj *v1alpha1.Object, last, desired *unstructured.Unstructured) (managed.ExternalObservation, error) {
 	isUpToDate := false
 
@@ -733,9 +774,26 @@ func (c *external) handleObservation(ctx context.Context, obj *v1alpha1.Object, 
 		// Treated as up-to-date as we don't update or create the resource
 		isUpToDate = true
 	}
-	if last != nil && equality.Semantic.DeepEqual(last, desired) {
-		// Mark as up-to-date since last is equal to desired
-		isUpToDate = true
+
+	// Debug comparison details
+	if last != nil && desired != nil {
+		equalWithoutMetadata := isEqualExcludingMetadata(last, desired)
+		equalWithMetadata := reflect.DeepEqual(last.Object, desired.Object)
+
+		c.logger.Debug("Comparison results",
+			"equalWithoutMetadata", equalWithoutMetadata,
+			"equalWithMetadata", equalWithMetadata,
+			"lastMetadata", last.Object["metadata"],
+			"desiredMetadata", desired.Object["metadata"])
+
+		if equalWithoutMetadata {
+			// Mark as up-to-date since last is equal to desired
+			isUpToDate = true
+		}
+
+		if equalWithoutMetadata && !equalWithMetadata {
+			c.logger.Debug("Objects differ only in metadata - preventing unnecessary update")
+		}
 	}
 
 	if isUpToDate {
