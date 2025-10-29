@@ -800,7 +800,10 @@ func (c *external) handleObservation(ctx context.Context, obj *v1alpha2.Object, 
 		c.logger.Debug("Up to date!")
 
 		if p := obj.Spec.Readiness.Policy; p == v1alpha2.ReadinessPolicySuccessfulCreate || p == "" {
-			obj.Status.SetConditions(xpv1.Available())
+			// Only set condition if it's not already Available to prevent unnecessary status updates
+			if !obj.Status.GetCondition(xpv1.TypeReady).Equal(xpv1.Available()) {
+				obj.Status.SetConditions(xpv1.Available())
+			}
 		}
 
 		cd, err := connectionDetails(ctx, c.client, obj.Spec.ConnectionDetails)
